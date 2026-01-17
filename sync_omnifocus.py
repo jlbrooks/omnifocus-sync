@@ -33,8 +33,49 @@ from requests.auth import HTTPDigestAuth
 from OmniDecrypt import DocumentKey, decrypt_directory
 
 
+def list_html_directory(url: str, auth: HTTPDigestAuth, max_retries: int = 3) -> tuple[list[dict], str]:
+    """List contents of an Apache directory listing via HTML GET.
+
+    Fallback when PROPFIND is blocked by server configuration.
+
+    Returns:
+        Tuple of (file list, actual URL after redirects)
+    """
+    for attempt in range(max_retries):
+        response = requests.get(url, auth=auth, allow_redirects=True)
+        if response.status_code == 200:
+            break
+        elif response.status_code == 401 and attempt < max_retries - 1:
+            wait_time = 2 ** attempt
+            print(f"  Auth failed, retrying in {wait_time}s...")
+            time.sleep(wait_time)
+        else:
+            response.raise_for_status()
+
+    response.raise_for_status()
+    actual_url = response.url
+
+    # Parse Apache directory listing HTML: <a href="filename">
+    hrefs = re.findall(r'<a href="([^"]+)">', response.text)
+
+    files = []
+    for href in hrefs:
+        # Skip parent directory and sorting links
+        if href.startswith('?') or href.startswith('/'):
+            continue
+        decoded = urllib.parse.unquote(href)
+        files.append({
+            'href': href,
+            'name': decoded.rstrip('/'),
+            'is_dir': decoded.endswith('/')
+        })
+    return files, actual_url
+
+
 def list_webdav_directory(url: str, auth: HTTPDigestAuth, max_retries: int = 3) -> tuple[list[dict], str]:
     """List contents of a WebDAV directory using PROPFIND.
+
+    Falls back to HTML directory listing if PROPFIND fails (some servers block it).
 
     Returns:
         Tuple of (file list, actual URL after redirects)
@@ -59,7 +100,9 @@ def list_webdav_directory(url: str, auth: HTTPDigestAuth, max_retries: int = 3) 
             print(f"  Auth failed, retrying in {wait_time}s...")
             time.sleep(wait_time)
         else:
-            response.raise_for_status()
+            # PROPFIND blocked - fall back to HTML parsing
+            print("  PROPFIND blocked, using HTML directory listing...")
+            return list_html_directory(url, auth, max_retries)
 
     response.raise_for_status()
 
@@ -98,14 +141,40 @@ def download_file(url: str, auth: HTTPDigestAuth, output_path: Path, max_retries
             f.write(chunk)
 
 
+def resolve_sync_url(username: str, auth: HTTPDigestAuth) -> str:
+    """Resolve the actual sync server URL by following redirects."""
+    base_url = f"https://sync.omnigroup.com/{username}/OmniFocus.ofocus/"
+
+    # Follow redirects to find actual sync server (e.g., sync5.omnigroup.com)
+    # Note: Don't pass auth here - it won't be sent to redirected host anyway
+    response = requests.head(base_url, allow_redirects=True)
+    actual_url = response.url
+    print(f"  Redirected to: {actual_url}")
+
+    # Now authenticate to the resolved URL directly (fresh auth negotiation)
+    response = requests.get(actual_url, auth=auth)
+    if response.status_code == 401:
+        # Try with a session for persistent auth
+        session = requests.Session()
+        session.auth = auth
+        response = session.get(actual_url)
+
+    response.raise_for_status()
+    return actual_url
+
+
 def download_bundle(username: str, password: str, output_dir: Path) -> Path:
     """Download the OmniFocus.ofocus bundle from Omni Sync Server."""
-    base_url = f"https://sync.omnigroup.com/{username}/OmniFocus.ofocus/"
     auth = HTTPDigestAuth(username, password)
 
-    # List files - handles redirect manually to preserve PROPFIND method
+    # Resolve actual sync server URL (handles sync.omnigroup.com -> sync5.omnigroup.com redirect)
+    print("Resolving sync server...")
+    base_url = resolve_sync_url(username, auth)
+    print(f"Using: {base_url}")
+
+    # List files
     print("Listing bundle contents...")
-    files, actual_url = list_webdav_directory(base_url, auth)
+    files, actual_url = list_html_directory(base_url, auth)
     print(f"Sync URL: {actual_url}")
     print(f"Found {len(files)} items")
 
