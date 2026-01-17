@@ -22,6 +22,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -32,30 +33,63 @@ from requests.auth import HTTPDigestAuth
 from OmniDecrypt import DocumentKey, decrypt_directory
 
 
-def list_webdav_directory(url: str, auth: HTTPDigestAuth) -> list[dict]:
-    """List contents of a WebDAV directory using PROPFIND."""
+def list_webdav_directory(url: str, auth: HTTPDigestAuth, max_retries: int = 3) -> tuple[list[dict], str]:
+    """List contents of a WebDAV directory using PROPFIND.
+
+    Returns:
+        Tuple of (file list, actual URL after redirects)
+    """
     headers = {"Depth": "1"}
-    response = requests.request("PROPFIND", url, auth=auth, headers=headers)
+
+    for attempt in range(max_retries):
+        # Don't follow redirects automatically - PROPFIND gets converted to GET on redirect
+        response = requests.request("PROPFIND", url, auth=auth, headers=headers, allow_redirects=False)
+
+        # Handle redirect manually to preserve PROPFIND method
+        if response.status_code in (301, 302, 303, 307, 308):
+            redirect_url = response.headers.get('Location')
+            if redirect_url:
+                # Make PROPFIND request to redirect target with fresh auth
+                response = requests.request("PROPFIND", redirect_url, auth=auth, headers=headers)
+
+        if response.status_code == 207:
+            break
+        elif response.status_code == 401 and attempt < max_retries - 1:
+            wait_time = 2 ** attempt  # exponential backoff: 1, 2, 4 seconds
+            print(f"  Auth failed, retrying in {wait_time}s...")
+            time.sleep(wait_time)
+        else:
+            response.raise_for_status()
+
     response.raise_for_status()
 
+    actual_url = response.url
     hrefs = re.findall(r'<D:href>([^<]+)</D:href>', response.text)
 
     files = []
     for href in hrefs:
         decoded = urllib.parse.unquote(href)
-        if decoded.rstrip('/') == urllib.parse.urlparse(url).path.rstrip('/'):
+        if decoded.rstrip('/') == urllib.parse.urlparse(actual_url).path.rstrip('/'):
             continue
         files.append({
             'href': href,
             'name': os.path.basename(decoded.rstrip('/')),
             'is_dir': decoded.endswith('/')
         })
-    return files
+    return files, actual_url
 
 
-def download_file(url: str, auth: HTTPDigestAuth, output_path: Path) -> None:
+def download_file(url: str, auth: HTTPDigestAuth, output_path: Path, max_retries: int = 3) -> None:
     """Download a single file from WebDAV."""
-    response = requests.get(url, auth=auth, stream=True)
+    for attempt in range(max_retries):
+        response = requests.get(url, auth=auth, stream=True)
+        if response.status_code == 200:
+            break
+        elif response.status_code == 401 and attempt < max_retries - 1:
+            time.sleep(2 ** attempt)
+        else:
+            response.raise_for_status()
+
     response.raise_for_status()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -69,14 +103,10 @@ def download_bundle(username: str, password: str, output_dir: Path) -> Path:
     base_url = f"https://sync.omnigroup.com/{username}/OmniFocus.ofocus/"
     auth = HTTPDigestAuth(username, password)
 
-    # Get redirected URL
-    response = requests.head(base_url, auth=auth, allow_redirects=True)
-    actual_url = response.url
-    print(f"Sync URL: {actual_url}")
-
-    # List files
+    # List files - handles redirect manually to preserve PROPFIND method
     print("Listing bundle contents...")
-    files = list_webdav_directory(actual_url, auth)
+    files, actual_url = list_webdav_directory(base_url, auth)
+    print(f"Sync URL: {actual_url}")
     print(f"Found {len(files)} items")
 
     # Create bundle directory
