@@ -60,8 +60,8 @@ def list_html_directory(url: str, auth: HTTPDigestAuth, max_retries: int = 3) ->
 
     files = []
     for href in hrefs:
-        # Skip parent directory and sorting links
-        if href.startswith('?') or href.startswith('/'):
+        # Skip parent directory, sorting links, and mailto links
+        if href.startswith('?') or href.startswith('/') or href.startswith('mailto:'):
             continue
         decoded = urllib.parse.unquote(href)
         files.append({
@@ -163,8 +163,12 @@ def resolve_sync_url(username: str, auth: HTTPDigestAuth) -> str:
     return actual_url
 
 
-def download_bundle(username: str, password: str, output_dir: Path) -> Path:
-    """Download the OmniFocus.ofocus bundle from Omni Sync Server."""
+def download_bundle(username: str, password: str, output_dir: Path, incremental: bool = True) -> tuple[Path, int]:
+    """Download the OmniFocus.ofocus bundle from Omni Sync Server.
+
+    Returns:
+        Tuple of (bundle_dir, new_files_count)
+    """
     auth = HTTPDigestAuth(username, password)
 
     # Resolve actual sync server URL (handles sync.omnigroup.com -> sync5.omnigroup.com redirect)
@@ -176,21 +180,28 @@ def download_bundle(username: str, password: str, output_dir: Path) -> Path:
     print("Listing bundle contents...")
     files, actual_url = list_html_directory(base_url, auth)
     print(f"Sync URL: {actual_url}")
-    print(f"Found {len(files)} items")
+    print(f"Found {len(files)} items on server")
 
-    # Create bundle directory
+    # Create bundle directory (don't clear if incremental)
     bundle_dir = output_dir / "OmniFocus.ofocus"
-    if bundle_dir.exists():
+    if not incremental and bundle_dir.exists():
         shutil.rmtree(bundle_dir)
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
-    # Download each file
-    for i, file_info in enumerate(files):
-        name = file_info['name']
-        if file_info['is_dir']:
-            continue
+    # Filter to files we don't have yet (incremental)
+    existing_files = {f.name for f in bundle_dir.iterdir()} if bundle_dir.exists() else set()
+    files_to_download = [f for f in files if not f['is_dir'] and f['name'] not in existing_files]
 
-        print(f"  [{i+1}/{len(files)}] {name}")
+    if not files_to_download:
+        print("  No new files to download")
+        return bundle_dir, 0
+
+    print(f"  Downloading {len(files_to_download)} new file(s)...")
+
+    # Download each new file
+    for i, file_info in enumerate(files_to_download):
+        name = file_info['name']
+        print(f"  [{i+1}/{len(files_to_download)}] {name}")
         file_url = urllib.parse.urljoin(actual_url, file_info['href'])
         output_path = bundle_dir / name
 
@@ -199,11 +210,15 @@ def download_bundle(username: str, password: str, output_dir: Path) -> Path:
         except Exception as e:
             print(f"    ERROR: {e}")
 
-    return bundle_dir
+    return bundle_dir, len(files_to_download)
 
 
-def decrypt_bundle(bundle_dir: Path, output_dir: Path, passphrase: str) -> None:
-    """Decrypt the OmniFocus bundle."""
+def decrypt_bundle(bundle_dir: Path, output_dir: Path, passphrase: str, incremental: bool = True) -> int:
+    """Decrypt the OmniFocus bundle.
+
+    Returns:
+        Number of files decrypted
+    """
     print(f"\nDecrypting bundle...")
 
     # Load encryption metadata
@@ -211,7 +226,7 @@ def decrypt_bundle(bundle_dir: Path, output_dir: Path, passphrase: str) -> None:
     if not metadata_path.exists():
         print("No encryption metadata found - bundle may not be encrypted")
         shutil.copytree(bundle_dir, output_dir)
-        return
+        return 0
 
     with open(metadata_path, 'rb') as f:
         encryption_metadata = DocumentKey.parse_metadata(f)
@@ -224,19 +239,23 @@ def decrypt_bundle(bundle_dir: Path, output_dir: Path, passphrase: str) -> None:
     key_data = key_obj.data if hasattr(key_obj, 'data') else key_obj
     doc_key = DocumentKey(key_data, unwrapping_key=metadata_key)
 
-    print("Key slots found:")
-    for secret in doc_key.secrets:
-        secret.print()
-
-    # Decrypt all files
-    if output_dir.exists():
+    # Create output dir (don't clear if incremental)
+    if not incremental and output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for file_path in bundle_dir.iterdir():
-        if file_path.name == "encrypted":
-            continue
+    # Find files to decrypt (skip already decrypted if incremental)
+    existing_files = {f.name for f in output_dir.iterdir()} if output_dir.exists() else set()
+    files_to_decrypt = [f for f in bundle_dir.iterdir()
+                        if f.name != "encrypted" and f.name not in existing_files]
 
+    if not files_to_decrypt:
+        print("  No new files to decrypt")
+        return 0
+
+    print(f"  Decrypting {len(files_to_decrypt)} new file(s)...")
+
+    for file_path in files_to_decrypt:
         output_path = output_dir / file_path.name
         print(f"  Decrypting: {file_path.name}")
 
@@ -249,6 +268,26 @@ def decrypt_bundle(bundle_dir: Path, output_dir: Path, passphrase: str) -> None:
                     infp.seek(0)
                     outfp.write(infp.read())
 
+    return len(files_to_decrypt)
+
+
+def build_database(data_dir: Path, db_path: Path) -> None:
+    """Build/update the SQLite database from transaction files."""
+    import subprocess
+    script_dir = Path(__file__).parent
+    build_script = script_dir / "build_db.py"
+
+    if not build_script.exists():
+        print("  build_db.py not found, skipping database build")
+        return
+
+    result = subprocess.run(
+        [sys.executable, str(build_script), "--data-dir", str(data_dir), "--output", str(db_path)],
+        cwd=script_dir
+    )
+    if result.returncode != 0:
+        print("  Warning: database build failed")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Sync OmniFocus from Omni Sync Server")
@@ -260,8 +299,12 @@ def main():
                         help='Omni Sync password (or set OMNISYNC_PASS)')
     parser.add_argument('--output', '-o', type=Path, default=Path('./omnifocus-data'),
                         help='Output directory for decrypted data')
-    parser.add_argument('--keep-encrypted', action='store_true',
-                        help='Keep the encrypted bundle after decryption')
+    parser.add_argument('--db', type=Path, default=Path('./omnifocus.sqlite'),
+                        help='SQLite database path')
+    parser.add_argument('--full', action='store_true',
+                        help='Full sync (re-download and re-decrypt everything)')
+    parser.add_argument('--no-db', action='store_true',
+                        help='Skip database build after sync')
 
     args = parser.parse_args()
 
@@ -274,33 +317,38 @@ def main():
     if not password:
         password = getpass.getpass("Omni Sync password: ")
 
-    # Create temp directory for encrypted bundle
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
+    incremental = not args.full
 
-        # Download
-        print("=" * 60)
-        print("DOWNLOADING OMNIFOCUS BUNDLE")
-        print("=" * 60)
-        bundle_dir = download_bundle(username, password, tmpdir)
+    # Use persistent directory for encrypted bundle (enables incremental download)
+    script_dir = Path(__file__).parent
+    encrypted_dir = script_dir / ".encrypted-bundle"
 
-        # Decrypt
+    # Download
+    print("=" * 60)
+    print("DOWNLOADING OMNIFOCUS BUNDLE")
+    print("=" * 60)
+    bundle_dir, downloaded = download_bundle(username, password, encrypted_dir, incremental=incremental)
+
+    # Decrypt
+    print("\n" + "=" * 60)
+    print("DECRYPTING BUNDLE")
+    print("=" * 60)
+    decrypted = decrypt_bundle(bundle_dir, args.output, password, incremental=incremental)
+
+    # Build database
+    if not args.no_db:
         print("\n" + "=" * 60)
-        print("DECRYPTING BUNDLE")
+        print("BUILDING DATABASE")
         print("=" * 60)
-        decrypt_bundle(bundle_dir, args.output, password)
-
-        if args.keep_encrypted:
-            encrypted_dir = args.output.parent / "encrypted-bundle"
-            shutil.copytree(bundle_dir, encrypted_dir)
-            print(f"\nEncrypted bundle saved to: {encrypted_dir}")
+        build_database(args.output, args.db)
 
     print("\n" + "=" * 60)
     print("SYNC COMPLETE")
     print("=" * 60)
-    print(f"Decrypted data written to: {args.output}")
-    print(f"\nTo view task data, extract the .zip files:")
-    print(f"  unzip -p {args.output}/00000000000000*.zip contents.xml | less")
+    print(f"Downloaded: {downloaded} new file(s)")
+    print(f"Decrypted: {decrypted} new file(s)")
+    print(f"Data: {args.output}")
+    print(f"Database: {args.db}")
 
 
 if __name__ == '__main__':

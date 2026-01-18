@@ -11,5 +11,6 @@ wheels/
 
 # Data
 omnifocus-data/
+.encrypted-bundle/
 *.sqlite
 *.db
