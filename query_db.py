@@ -46,12 +46,15 @@ def parse_filter_rule(rule: dict, negated: bool = False) -> list[str]:
     if "actionAvailability" in rule:
         avail = rule["actionAvailability"]
         if avail == "available":
+            # Available = not completed AND (no defer date OR defer date <= today)
             if negated:
-                conditions.append("t.date_completed IS NOT NULL")
+                # NOT available = completed OR deferred to future
+                conditions.append("(t.date_completed IS NOT NULL OR (t.date_start IS NOT NULL AND date(t.date_start) > date('now')))")
             else:
                 conditions.append("t.date_completed IS NULL")
+                conditions.append("(t.date_start IS NULL OR date(t.date_start) <= date('now'))")
         elif avail == "remaining":
-            # Remaining = not completed (same as available for our purposes)
+            # Remaining = not completed (may still be deferred)
             if negated:
                 conditions.append("t.date_completed IS NOT NULL")
             else:
@@ -140,8 +143,13 @@ def get_perspective_conditions(conn: sqlite3.Connection, perspective_name: str) 
 
             if sub_condition_groups:
                 if agg_type == "any":
-                    # OR together the first condition from each group
-                    or_parts = [g[0] for g in sub_condition_groups if g]
+                    # Each sub-rule's conditions are ANDed, then OR across sub-rules
+                    or_parts = []
+                    for group in sub_condition_groups:
+                        if len(group) == 1:
+                            or_parts.append(group[0])
+                        elif len(group) > 1:
+                            or_parts.append(f"({' AND '.join(group)})")
                     if or_parts:
                         conditions.append(f"({' OR '.join(or_parts)})")
                 elif agg_type == "all":
@@ -189,7 +197,7 @@ def list_tasks(conn: sqlite3.Connection, args) -> None:
     where = " AND ".join(conditions)
 
     query = f"""
-        SELECT t.id, t.name, t.date_due, t.flagged, c.name as context_name,
+        SELECT t.id, t.name, t.date_due, t.date_start, t.flagged, c.name as context_name,
                p.name as project_name
         FROM Task t
         LEFT JOIN Context c ON t.context = c.id
@@ -207,22 +215,23 @@ def list_tasks(conn: sqlite3.Connection, args) -> None:
             "id": r[0],
             "name": r[1],
             "due": r[2],
-            "flagged": bool(r[3]),
-            "context": r[4],
-            "project": r[5]
+            "defer": r[3],
+            "flagged": bool(r[4]),
+            "context": r[5],
+            "project": r[6]
         } for r in rows], indent=2))
         return
 
-    print(f"{'Name':<50} {'Due':<12} {'Context':<15} {'Project':<20}")
-    print("-" * 97)
+    print(f"{'Name':<40} {'Due':<12} {'Defer':<12} {'Project':<25}")
+    print("-" * 89)
 
     for row in rows:
-        name = (row[1] or "(no name)")[:48]
-        flag = "⚑ " if row[3] else "  "
+        name = (row[1] or "(no name)")[:38]
+        flag = "⚑ " if row[4] else "  "
         due = format_date(row[2])
-        context = (row[4] or "")[:13]
-        project = (row[5] or "")[:18]
-        print(f"{flag}{name:<48} {due:<12} {context:<15} {project:<20}")
+        defer = format_date(row[3])
+        project = (row[6] or "")[:23]
+        print(f"{flag}{name:<38} {due:<12} {defer:<12} {project:<25}")
 
     print(f"\n{len(rows)} task(s)")
 
