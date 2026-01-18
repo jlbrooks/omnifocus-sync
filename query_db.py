@@ -204,7 +204,7 @@ def list_tasks(conn: sqlite3.Connection, args) -> None:
         LEFT JOIN Context c ON t.context = c.id
         LEFT JOIN Task p ON t.parent_task = p.id
         WHERE {where}
-        ORDER BY t.flagged DESC, t.date_due ASC NULLS LAST, t.rank
+        ORDER BY t.flagged DESC, t.date_start ASC NULLS LAST, t.date_due ASC NULLS LAST, t.rank
         LIMIT {args.limit}
     """
 
