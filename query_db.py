@@ -33,12 +33,155 @@ def format_date(iso_date: str | None) -> str:
         return iso_date[:10] if iso_date else ""
 
 
+def parse_filter_rule(rule: dict, negated: bool = False) -> list[str]:
+    """Parse a single filter rule into SQL conditions.
+
+    Args:
+        rule: The filter rule dict
+        negated: If True, generate NULL-safe negated conditions
+    """
+    conditions = []
+
+    # Direct rules
+    if "actionAvailability" in rule:
+        avail = rule["actionAvailability"]
+        if avail == "available":
+            if negated:
+                conditions.append("t.date_completed IS NOT NULL")
+            else:
+                conditions.append("t.date_completed IS NULL")
+        elif avail == "remaining":
+            # Remaining = not completed (same as available for our purposes)
+            if negated:
+                conditions.append("t.date_completed IS NOT NULL")
+            else:
+                conditions.append("t.date_completed IS NULL")
+        elif avail == "completed":
+            if negated:
+                conditions.append("t.date_completed IS NULL")
+            else:
+                conditions.append("t.date_completed IS NOT NULL")
+
+    if "actionHasDueDate" in rule and rule["actionHasDueDate"]:
+        if negated:
+            conditions.append("t.date_due IS NULL")
+        else:
+            conditions.append("t.date_due IS NOT NULL")
+
+    if "actionHasDeferDate" in rule and rule["actionHasDeferDate"]:
+        if negated:
+            conditions.append("t.date_start IS NULL")
+        else:
+            conditions.append("t.date_start IS NOT NULL")
+
+    if "actionIsLeaf" in rule and rule["actionIsLeaf"]:
+        if negated:
+            conditions.append("t.is_project = 1")
+        else:
+            conditions.append("t.is_project = 0")
+
+    if "actionWithinFocus" in rule:
+        ids = rule["actionWithinFocus"]
+        id_list = ",".join(f"'{id}'" for id in ids)
+        if negated:
+            # NULL-safe negation: NULL means not in the focus, so include those rows
+            # (col IS NULL OR col NOT IN (...)) for each column
+            conditions.append(
+                f"((t.project_folder IS NULL OR t.project_folder NOT IN ({id_list})) "
+                f"AND (t.parent_task IS NULL OR t.parent_task NOT IN ({id_list})) "
+                f"AND (p.project_folder IS NULL OR p.project_folder NOT IN ({id_list})))"
+            )
+        else:
+            # Check task's folder, parent task (project), or parent project's folder
+            conditions.append(f"(t.project_folder IN ({id_list}) OR t.parent_task IN ({id_list}) OR p.project_folder IN ({id_list}))")
+
+    if "actionHasAnyOfTags" in rule:
+        tag_ids = rule["actionHasAnyOfTags"]
+        tag_list = ",".join(f"'{id}'" for id in tag_ids)
+        if negated:
+            conditions.append(f"(t.context IS NULL OR t.context NOT IN ({tag_list}))")
+        else:
+            conditions.append(f"t.context IN ({tag_list})")
+
+    return conditions
+
+
+def get_perspective_conditions(conn: sqlite3.Connection, perspective_name: str) -> list[str]:
+    """Convert perspective filter rules to SQL conditions."""
+    cursor = conn.execute(
+        "SELECT filter_rules FROM Perspective WHERE name = ? OR id = ?",
+        (perspective_name, perspective_name)
+    )
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        return []
+
+    rules = json.loads(row[0])
+    conditions = []
+
+    for rule in rules:
+        # Handle direct rule properties
+        direct_conditions = parse_filter_rule(rule)
+        conditions.extend(direct_conditions)
+
+        # Handle aggregate rules
+        if "aggregateType" in rule:
+            agg_type = rule["aggregateType"]
+            agg_rules = rule.get("aggregateRules", [])
+
+            sub_condition_groups = []
+            for sub_rule in agg_rules:
+                # Skip disabled rules
+                if "disabledRule" in sub_rule:
+                    continue
+                sub_conds = parse_filter_rule(sub_rule)
+                if sub_conds:
+                    sub_condition_groups.append(sub_conds)
+
+            if sub_condition_groups:
+                if agg_type == "any":
+                    # OR together the first condition from each group
+                    or_parts = [g[0] for g in sub_condition_groups if g]
+                    if or_parts:
+                        conditions.append(f"({' OR '.join(or_parts)})")
+                elif agg_type == "all":
+                    for group in sub_condition_groups:
+                        conditions.extend(group)
+                elif agg_type == "none":
+                    # "none" = exclusion. Parse first rule with negated=True for NULL-safe NOT
+                    if agg_rules:
+                        first_rule = agg_rules[0]
+                        if "disabledRule" not in first_rule:
+                            negated_conds = parse_filter_rule(first_rule, negated=True)
+                            conditions.extend(negated_conds)
+                    # Remaining rules are OR'd inclusions (positive)
+                    if len(agg_rules) > 1:
+                        remaining_groups = []
+                        for sub_rule in agg_rules[1:]:
+                            if "disabledRule" in sub_rule:
+                                continue
+                            sub_conds = parse_filter_rule(sub_rule)
+                            if sub_conds:
+                                remaining_groups.append(sub_conds)
+                        if remaining_groups:
+                            or_parts = [g[0] for g in remaining_groups if g]
+                            if or_parts:
+                                conditions.append(f"({' OR '.join(or_parts)})")
+
+    return conditions
+
+
 def list_tasks(conn: sqlite3.Connection, args) -> None:
     """List tasks with optional filters."""
     conditions = ["t.deleted = 0"]
 
-    if not args.all:
-        conditions.append("t.date_completed IS NULL")
+    # Apply perspective filters if specified
+    if hasattr(args, 'perspective') and args.perspective:
+        perspective_conditions = get_perspective_conditions(conn, args.perspective)
+        conditions.extend(perspective_conditions)
+    else:
+        if not args.all:
+            conditions.append("t.date_completed IS NULL")
 
     if args.inbox:
         conditions.append("t.inbox = 1")
@@ -269,6 +412,7 @@ def main():
 
     # Tasks
     tasks_parser = subparsers.add_parser("tasks", help="List tasks")
+    tasks_parser.add_argument("--perspective", "--persp", help="Filter by perspective name (e.g., Available, Work)")
     tasks_parser.add_argument("--all", "-a", action="store_true", help="Include completed")
     tasks_parser.add_argument("--inbox", "-i", action="store_true", help="Inbox only")
     tasks_parser.add_argument("--flagged", "-f", action="store_true", help="Flagged only")
