@@ -78,10 +78,11 @@ def parse_filter_rule(rule: dict, negated: bool = False) -> list[str]:
             conditions.append("t.date_start IS NOT NULL")
 
     if "actionIsLeaf" in rule and rule["actionIsLeaf"]:
+        # Leaf = has no child tasks (not about is_project flag)
         if negated:
-            conditions.append("t.is_project = 1")
+            conditions.append("EXISTS (SELECT 1 FROM Task child WHERE child.parent_task = t.id AND child.deleted = 0)")
         else:
-            conditions.append("t.is_project = 0")
+            conditions.append("NOT EXISTS (SELECT 1 FROM Task child WHERE child.parent_task = t.id AND child.deleted = 0)")
 
     if "actionWithinFocus" in rule:
         ids = rule["actionWithinFocus"]
