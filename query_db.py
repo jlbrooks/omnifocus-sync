@@ -148,25 +148,13 @@ def get_perspective_conditions(conn: sqlite3.Connection, perspective_name: str) 
                     for group in sub_condition_groups:
                         conditions.extend(group)
                 elif agg_type == "none":
-                    # "none" = exclusion. Parse first rule with negated=True for NULL-safe NOT
-                    if agg_rules:
-                        first_rule = agg_rules[0]
-                        if "disabledRule" not in first_rule:
-                            negated_conds = parse_filter_rule(first_rule, negated=True)
-                            conditions.extend(negated_conds)
-                    # Remaining rules are OR'd inclusions (positive)
-                    if len(agg_rules) > 1:
-                        remaining_groups = []
-                        for sub_rule in agg_rules[1:]:
-                            if "disabledRule" in sub_rule:
-                                continue
-                            sub_conds = parse_filter_rule(sub_rule)
-                            if sub_conds:
-                                remaining_groups.append(sub_conds)
-                        if remaining_groups:
-                            or_parts = [g[0] for g in remaining_groups if g]
-                            if or_parts:
-                                conditions.append(f"({' OR '.join(or_parts)})")
+                    # "none" = match NONE of the rules = NOT(any) = NOT r1 AND NOT r2 AND ...
+                    # Negate ALL rules and AND them together
+                    for sub_rule in agg_rules:
+                        if "disabledRule" in sub_rule:
+                            continue
+                        negated_conds = parse_filter_rule(sub_rule, negated=True)
+                        conditions.extend(negated_conds)
 
     return conditions
 
